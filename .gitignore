@@ -1,0 +1,11 @@
+# 런타임 로그 (메일 내용 등 포함될 수 있음)
+*.log
+mail_dryrun.log
+
+# 로컬 전용 설정
+.claude/settings.local.json
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
