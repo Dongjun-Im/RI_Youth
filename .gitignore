@@ -2,6 +2,14 @@
 *.log
 mail_dryrun.log
 
+# 실제 비밀번호(DB·SMTP 등)가 든 파일 — 공개 저장소에 올리지 않음
+config.php
+_배포안내.txt
+
+# 참가자가 올린 사진·영상 (개인정보) — 폴더만 유지
+uploads/*
+!uploads/.gitkeep
+
 # 로컬 전용 설정
 .claude/settings.local.json
 

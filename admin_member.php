@@ -22,7 +22,8 @@ foreach (db()->query('SELECT * FROM items ORDER BY spot_id, sort_order, id') as 
 <h2 class="section-title"><?= h($m['team']) ?> · <?= h($m['name']) ?> 응답 상세</h2>
 <table class="admin-table"><tbody>
   <tr><th scope="row">제출 상태</th><td><?= $sub ? '<span class="badge ok">제출</span> ' . h(substr($sub['submitted_at'], 0, 16)) : '<span class="badge">미제출</span> (진행 ' . $prog['done'] . '/' . $prog['total'] . ')' ?></td></tr>
-  <tr><th scope="row">조사원 구분</th><td><?= h($sub['surveyor_type'] ?? '—') ?></td></tr>
+  <tr><th scope="row">조사원 구분</th><td><?= h($sub['surveyor_type'] ?? '—') ?><?= !empty($sub['vision_detail']) ? ' · ' . h($sub['vision_detail']) : '' ?></td></tr>
+  <tr><th scope="row">휠체어 사용</th><td><?= $sub === null ? '—' : ((string)($sub['wheelchair'] ?? '') === '1' ? '사용' : ((string)($sub['wheelchair'] ?? '') === '0' ? '미사용' : '미입력')) ?></td></tr>
   <tr><th scope="row">관광지</th><td><?= h($sub['site_name'] ?? '—') ?></td></tr>
 </tbody></table>
 

@@ -7,7 +7,7 @@ if (isset($_GET['logout'])) { unset($_SESSION['is_admin']); header('Location: ad
 // ── 로그인 처리 ──────────────────────────────────────────
 $error = '';
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && !is_admin() && isset($_POST['password'])) {
-    if (hash_equals(ADMIN_PASSWORD, (string)($_POST['password'] ?? ''))) {
+    if (admin_pw_verify((string)($_POST['password'] ?? ''))) {
         session_regenerate_id(true);
         $_SESSION['is_admin'] = true;
         header('Location: admin.php'); exit;
@@ -23,7 +23,7 @@ if (!is_admin()):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title><?= h(APP_TITLE) ?> — 관리자</title>
-<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="<?= asset_url('assets/style.css') ?>">
 </head>
 <body class="login-body">
   <main class="login-card">
@@ -93,21 +93,23 @@ function admin_export_csv(string $type): void {
                            $r['value'], $r['note']]);
         }
     } else {
-        // 제출 요약: 참가자별 제출 여부
-        $req = required_item_count();
-        fputcsv($out, ['조', '이름', '휴대폰', '제출', '제출시각', '조사원구분', '관광지명', '응답필수', '필수총']);
+        // 제출 요약: 참가자별 제출 여부 + 조 완료
+        fputcsv($out, ['조', '이름', '휴대폰', '제출', '제출시각', '조사원구분', '휠체어', '시각세부', '관광지명', '조완료']);
         $rows = db()->query(
-            'SELECT t.name AS team, m.name AS member, m.phone, m.id AS mid,
-                    sub.submitted_at, sub.surveyor_type, sub.site_name
+            'SELECT t.id AS team_id, t.name AS team, m.name AS member, m.phone, m.id AS mid,
+                    sub.submitted_at, sub.surveyor_type, sub.wheelchair, sub.vision_detail, sub.site_name
              FROM members m JOIN teams t ON t.id = m.team_id
              LEFT JOIN submissions sub ON sub.member_id = m.id
              ORDER BY t.id, m.id')->fetchAll();
         foreach ($rows as $r) {
-            $done = member_answered_count((int)$r['mid']);
+            $wc = (string)($r['wheelchair'] ?? '');
             fputcsv($out, [$r['team'], $r['member'], $r['phone'],
                            $r['submitted_at'] ? '제출' : '미제출',
                            $r['submitted_at'] ? substr($r['submitted_at'], 0, 16) : '',
-                           $r['surveyor_type'], $r['site_name'], $done, $req]);
+                           $r['surveyor_type'],
+                           $wc === '1' ? '사용' : ($wc === '0' ? '미사용' : ''),
+                           $r['vision_detail'], $r['site_name'],
+                           team_is_complete((int)$r['team_id']) ? '완료' : '진행중']);
         }
     }
     fclose($out);
@@ -197,11 +199,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 set_flash('ok', '항목을 삭제했습니다.');
                 $redirect = 'admin.php?view=checklist&spot=' . (int)($_POST['spot_id'] ?? 0); break;
 
-            // 완료 알림 메일 강제 발송
+            // 조별 완료 알림 메일 강제 발송
             case 'force_send':
-                $ok = force_send_completion();
+                $ok = force_send_team_completion((int)($_POST['team_id'] ?? 0));
                 set_flash($ok ? 'ok' : 'err',
-                    $ok ? '완료 알림 메일을 발송했습니다.' : '메일 발송에 실패했습니다. (발신 설정 확인)');
+                    $ok ? '해당 조 완료 알림 메일을 발송했습니다.' : '메일 발송에 실패했습니다. (발신 설정 확인)');
                 $redirect = 'admin.php'; break;
 
             // 발신(메일) 설정 저장
@@ -226,6 +228,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 set_flash($tok ? 'ok' : 'err', $tok ? '테스트 메일을 발송했습니다.' : ('테스트 메일 실패: ' . h($terr)));
                 $redirect = 'admin.php?view=settings'; break;
 
+            // 관리자 비밀번호 변경
+            case 'password_change':
+                $cur  = (string)($_POST['current_password'] ?? '');
+                $new1 = (string)($_POST['new_password']     ?? '');
+                $new2 = (string)($_POST['confirm_password'] ?? '');
+                if (!admin_pw_verify($cur)) {
+                    throw new RuntimeException('현재 비밀번호가 올바르지 않습니다.');
+                }
+                if ($new1 !== $new2) {
+                    throw new RuntimeException('새 비밀번호와 확인이 일치하지 않습니다.');
+                }
+                if (strlen($new1) < 8) {
+                    throw new RuntimeException('비밀번호는 최소 8자 이상이어야 합니다.');
+                }
+                if ($new1 === $cur) {
+                    throw new RuntimeException('이전 비밀번호와 동일합니다. 다른 비밀번호로 바꿔주세요.');
+                }
+                admin_pw_set($new1);
+                set_flash('ok', '비밀번호를 변경했습니다.');
+                $redirect = 'admin.php?view=password'; break;
+
             default:
                 throw new RuntimeException('알 수 없는 요청입니다.');
         }
@@ -239,14 +262,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
 $flash = $_SESSION['flash'] ?? null;
 unset($_SESSION['flash']);
 $view = $_GET['view'] ?? 'dashboard';
-if (!in_array($view, ['dashboard', 'members', 'checklist', 'settings', 'member'], true)) $view = 'dashboard';
+if (!in_array($view, ['dashboard', 'members', 'checklist', 'settings', 'member', 'password', 'help'], true)) $view = 'dashboard';
 ?>
 <!DOCTYPE html>
 <html lang="ko"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title><?= h(APP_TITLE) ?> — 관리자</title>
-<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="<?= asset_url('assets/style.css') ?>">
 <?php if ($view === 'dashboard'): ?><meta http-equiv="refresh" content="30"><!-- 30초 자동 갱신 --><?php endif; ?>
 </head>
 <body>
@@ -266,6 +289,8 @@ if (!in_array($view, ['dashboard', 'members', 'checklist', 'settings', 'member']
     <a class="navlink <?= $view === 'members' ? 'active' : '' ?>" href="admin.php?view=members">👥 참가자 관리</a>
     <a class="navlink <?= $view === 'checklist' ? 'active' : '' ?>" href="admin.php?view=checklist">🗂️ 체크리스트 관리</a>
     <a class="navlink <?= $view === 'settings' ? 'active' : '' ?>" href="admin.php?view=settings">⚙️ 발신 설정</a>
+    <a class="navlink <?= $view === 'password' ? 'active' : '' ?>" href="admin.php?view=password">🔑 비밀번호 변경</a>
+    <a class="navlink <?= $view === 'help' ? 'active' : '' ?>" href="admin.php?view=help">❓ 도움말</a>
   </div>
 </nav>
 
@@ -277,8 +302,11 @@ if (!in_array($view, ['dashboard', 'members', 'checklist', 'settings', 'member']
     if ($view === 'members')        include __DIR__ . '/admin_members.php';
     elseif ($view === 'checklist')  include __DIR__ . '/admin_checklist.php';
     elseif ($view === 'settings')   include __DIR__ . '/admin_settings.php';
+    elseif ($view === 'password')   include __DIR__ . '/admin_password.php';
+    elseif ($view === 'help')       include __DIR__ . '/admin_help.php';
     elseif ($view === 'member')     include __DIR__ . '/admin_member.php';
     else                            include __DIR__ . '/admin_dashboard.php';
   ?>
 </main>
+<?php include __DIR__ . '/_footer.php'; ?>
 </body></html>

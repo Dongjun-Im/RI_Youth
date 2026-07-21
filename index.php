@@ -1,5 +1,9 @@
 <?php
 require_once __DIR__ . '/lib.php';
+no_store_headers();
+
+// 참가자 접속 허용 기간이 아니면 안내만 표시
+if (!participant_access_open()) { render_access_closed(); }
 
 // 이미 로그인 상태면 앱으로
 if (current_member()) { header('Location: app.php'); exit; }
@@ -17,7 +21,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title><?= h(APP_TITLE) ?> — 로그인</title>
-<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="<?= asset_url('assets/style.css') ?>">
 </head>
 <body class="login-body">
   <main class="login-card">
@@ -39,5 +43,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     <p class="admin-link"><a href="admin.php">관리자 로그인 →</a></p>
   </main>
+<?php include __DIR__ . '/_footer.php'; ?>
 </body>
 </html>

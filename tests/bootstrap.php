@@ -25,6 +25,9 @@ define('MAIL_DRY_RUN', true);                 // 실제 발송 금지, mail_dryr
 define('NOTIFY_TO', 'test-operator@example.com');
 define('NOTIFY_TO_NAME', '테스트 운영진');
 define('ADMIN_PASSWORD', 'test-admin-pw');
+// 접속 허용 기간을 '지금'을 포함하도록 정의 (participant_access_open 테스트용)
+define('ACCESS_START', date('Y-m-d H:i:s', time() - 86400));
+define('ACCESS_END',   date('Y-m-d H:i:s', time() + 86400));
 
 $ROOT = dirname(__DIR__);
 
@@ -92,15 +95,18 @@ function reset_test_db(): PDO {
         CREATE TABLE submissions (
             member_id     INTEGER PRIMARY KEY,
             surveyor_type TEXT NULL,
+            wheelchair    INTEGER NULL,
+            vision_detail TEXT NULL,
             site_name     TEXT NULL,
             submitted_at  TEXT NOT NULL,
             FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE CASCADE
         );
         CREATE TABLE completions (
-            id           INTEGER PRIMARY KEY,
+            team_id      INTEGER PRIMARY KEY,
             completed_at TEXT NOT NULL,
             email_sent   INTEGER NOT NULL DEFAULT 0,
-            email_error  TEXT NULL
+            email_error  TEXT NULL,
+            FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE
         );
         CREATE TABLE settings (
             skey   TEXT PRIMARY KEY,
@@ -108,15 +114,18 @@ function reset_test_db(): PDO {
         );
     ');
 
-    // ── 조 / 참가자 시드 ──
-    $pdo->exec("INSERT INTO teams (id,name) VALUES (1,'1조'),(2,'2조'),(3,'3조'),(4,'4조'),(5,'5조')");
-    $pdo->exec("INSERT INTO members (team_id,name,phone) VALUES
-        (1,'홍길동','01011110001'),
-        (1,'김철수','01011110002'),
-        (2,'이영희','01022220001'),
-        (3,'박민수','01033330001'),
-        (4,'최지우','01044440001'),
-        (5,'정하나','01055550001')");
+    // ── 조 / 참가자 시드 (팀 완료 임계값 테스트 위해 1조에 6명) ──
+    $pdo->exec("INSERT INTO teams (id,name) VALUES (1,'1조'),(2,'2조'),(3,'3조')");
+    $pdo->exec("INSERT INTO members (id,team_id,name,phone) VALUES
+        (1,1,'홍길동','01011110001'),
+        (2,1,'김철수','01011110002'),
+        (3,1,'박영수','01011110003'),
+        (4,1,'최민호','01011110004'),
+        (5,1,'정다은','01011110005'),
+        (6,1,'강하늘','01011110006'),
+        (7,2,'이영희','01022220001'),
+        (8,2,'오세훈','01022220002'),
+        (9,3,'박민수','01033330001')");
 
     // ── 대분류 탭 시드 ──
     $pdo->exec("INSERT INTO spots (id,name,sort_order) VALUES

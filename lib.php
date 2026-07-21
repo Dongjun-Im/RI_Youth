@@ -2,12 +2,84 @@
 require_once __DIR__ . '/db.php';
 
 if (session_status() === PHP_SESSION_NONE) {
-    session_start();
+    // 모바일에서 로그인 세션이 잘 유지되도록 쿠키를 견고하게 설정.
+    // (탭 절전/새로고침에도 로그인 유지 · HTTPS 환경이면 Secure)
+    $__https = (!empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off')
+            || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https')
+            || (($_SERVER['SERVER_PORT'] ?? '') == 443);
+    @ini_set('session.gc_maxlifetime', '28800');   // 서버측 세션 수명 8시간
+    @ini_set('session.use_strict_mode', '1');
+    if (PHP_VERSION_ID >= 70300) {
+        @session_set_cookie_params([
+            'lifetime' => 28800,           // 쿠키 8시간 유지(브라우저 재시작에도)
+            'path'     => '/',
+            'secure'   => $__https,
+            'httponly' => true,
+            'samesite' => 'Lax',
+        ]);
+    } else {
+        @session_set_cookie_params(28800, '/', '', $__https, true);
+    }
+    @session_start();
 }
 
 /** HTML 이스케이프 */
 function h($s): string {
     return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8');
+}
+
+/** 자산 URL에 파일 수정시각을 버전으로 붙여 브라우저 캐시를 무효화 */
+function asset_url(string $rel): string {
+    $v = @filemtime(__DIR__ . '/' . ltrim($rel, '/'));
+    return h($rel) . ($v ? '?v=' . $v : '');
+}
+
+/** 동적 페이지가 캐시(및 bfcache)되지 않도록 헤더 전송 (출력 전에 호출) */
+function no_store_headers(): void {
+    if (headers_sent()) return;
+    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+    header('Pragma: no-cache');
+    header('Expires: 0');
+}
+
+// ── 참가자 접속 허용 기간 ─────────────────────────────────
+/** 지금이 참가자 접속 허용 기간 안인가? (관리자는 이 제한을 받지 않음) */
+function participant_access_open(): bool {
+    $start = defined('ACCESS_START') ? (string)ACCESS_START : '';
+    $end   = defined('ACCESS_END')   ? (string)ACCESS_END   : '';
+    if ($start === '' || $end === '') return true;   // 미설정이면 제한 없음
+    $now = time();
+    return $now >= strtotime($start) && $now <= strtotime($end);
+}
+/** 접속 허용 기간 안내 문구 (예: 2026-07-23 ~ 2026-07-24) */
+function access_window_text(): string {
+    $s = defined('ACCESS_START') ? date('Y-m-d', strtotime((string)ACCESS_START)) : '';
+    $e = defined('ACCESS_END')   ? date('Y-m-d', strtotime((string)ACCESS_END))   : '';
+    return $s && $e ? "{$s} ~ {$e}" : '';
+}
+/** 접속 불가 안내 페이지를 출력하고 종료 (참가자 페이지 상단에서 호출) */
+function render_access_closed(): void {
+    no_store_headers();
+    $title  = h(APP_TITLE);
+    $window = h(access_window_text());
+    http_response_code(403);
+    echo <<<HTML
+<!DOCTYPE html><html lang="ko"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{$title} — 접속 기간 아님</title>
+<link rel="stylesheet" href="assets/style.css">
+</head><body class="login-body">
+  <main class="login-card">
+    <h1 class="login-title">{$title}</h1>
+    <div class="alert error" role="alert" style="margin-top:12px">
+      지금은 조사 접속 기간이 아닙니다.<br>
+      <strong>조사 기간: {$window}</strong><br>
+      기간 내에 다시 접속해 주세요.
+    </div>
+  </main>
+</body></html>
+HTML;
+    exit;
 }
 
 /** 휴대폰번호 정규화: 숫자만 남김 */
@@ -191,6 +263,122 @@ function member_progress(int $memberId): array {
             'pct' => $pct, 'complete' => ($total > 0 && $remaining === 0)];
 }
 
+/**
+ * 참가자의 탭(spot)별 진행 상황을 모두 반환.
+ * 반환: [spot_id => ['total'=>N,'done'=>M,'remaining'=>K,'complete'=>bool], ...]
+ * 필수 항목이 없는 탭은 complete=true 로 간주 (선택 항목만 있는 탭).
+ */
+function member_spot_progress(int $memberId): array {
+    $stTotals = db()->query(
+        'SELECT spot_id, COUNT(*) AS total
+           FROM items
+          WHERE required = 1
+          GROUP BY spot_id');
+    $totals = [];
+    foreach ($stTotals as $row) $totals[(int)$row['spot_id']] = (int)$row['total'];
+
+    $stDone = db()->prepare(
+        "SELECT i.spot_id, COUNT(*) AS done
+           FROM items i
+           JOIN responses r ON r.item_id = i.id AND r.member_id = ?
+          WHERE i.required = 1 AND r.value IS NOT NULL AND r.value <> ''
+          GROUP BY i.spot_id");
+    $stDone->execute([$memberId]);
+    $dones = [];
+    foreach ($stDone as $row) $dones[(int)$row['spot_id']] = (int)$row['done'];
+
+    // 전체 탭 목록 (필수 항목이 없는 탭도 포함시켜야 표시가 자연스러움)
+    $allSpots = db()->query('SELECT id FROM spots')->fetchAll(PDO::FETCH_COLUMN);
+
+    $out = [];
+    foreach ($allSpots as $spotId) {
+        $spotId = (int)$spotId;
+        $total = $totals[$spotId] ?? 0;
+        $done  = $dones[$spotId] ?? 0;
+        $remaining = max(0, $total - $done);
+        $out[$spotId] = [
+            'total' => $total,
+            'done' => $done,
+            'remaining' => $remaining,
+            'complete' => ($remaining === 0),  // 필수 없는 탭도 complete=true
+        ];
+    }
+    return $out;
+}
+
+/**
+ * 제출 가능 여부(완화된 기준): 필수 항목이 있는 탭 중 '하나라도' 완료하면 true.
+ * (기존: 모든 탭 완료 → 변경: 한 탭만 완료해도 제출 가능)
+ */
+function member_any_tab_complete(int $memberId): bool {
+    foreach (member_spot_progress($memberId) as $sp) {
+        if ($sp['total'] > 0 && $sp['complete']) return true;
+    }
+    return false;
+}
+
+// ── 팀(조) 단위 완료 ─────────────────────────────────────
+function team_complete_threshold(): int {
+    return defined('TEAM_COMPLETE_THRESHOLD') ? max(1, (int)TEAM_COMPLETE_THRESHOLD) : 5;
+}
+function team_member_count(int $teamId): int {
+    $st = db()->prepare('SELECT COUNT(*) FROM members WHERE team_id = ?');
+    $st->execute([$teamId]);
+    return (int)$st->fetchColumn();
+}
+/** 조에서 제출한 인원 수 */
+function team_submitted_count(int $teamId): int {
+    $st = db()->prepare(
+        'SELECT COUNT(*) FROM submissions s JOIN members m ON m.id = s.member_id WHERE m.team_id = ?');
+    $st->execute([$teamId]);
+    return (int)$st->fetchColumn();
+}
+/** 조가 완료(기준 인원 이상 제출)되었는가 */
+function team_is_complete(int $teamId): bool {
+    return team_submitted_count($teamId) >= team_complete_threshold();
+}
+/** 조원별 제출 여부 목록: [['id','name','submitted'(bool)], ...] */
+function team_members_status(int $teamId): array {
+    $st = db()->prepare(
+        'SELECT m.id, m.name, (s.member_id IS NOT NULL) AS submitted
+           FROM members m LEFT JOIN submissions s ON s.member_id = m.id
+          WHERE m.team_id = ? ORDER BY m.id');
+    $st->execute([$teamId]);
+    $out = [];
+    foreach ($st->fetchAll() as $r) {
+        $out[] = ['id' => (int)$r['id'], 'name' => $r['name'], 'submitted' => (bool)$r['submitted']];
+    }
+    return $out;
+}
+
+/**
+ * 조 전체의 조원별·탭별 진행 매트릭스 (참가자 '우리 조 진행상황' 페이지용).
+ * @return array{spots: array, members: array} 각 member: id/name/submitted/cells[spot_id=>진행]/done/total
+ */
+function team_progress_matrix(int $teamId): array {
+    $spots = db()->query('SELECT id, name FROM spots ORDER BY sort_order, id')->fetchAll();
+    $st = db()->prepare(
+        'SELECT m.id, m.name, (s.member_id IS NOT NULL) AS submitted
+           FROM members m LEFT JOIN submissions s ON s.member_id = m.id
+          WHERE m.team_id = ? ORDER BY m.id');
+    $st->execute([$teamId]);
+    $rows = [];
+    foreach ($st->fetchAll() as $m) {
+        $mid = (int)$m['id'];
+        $sp  = member_spot_progress($mid);
+        $cells = []; $totDone = 0; $totTotal = 0;
+        foreach ($spots as $s) {
+            $sid = (int)$s['id'];
+            $p = $sp[$sid] ?? ['total' => 0, 'done' => 0, 'remaining' => 0, 'complete' => true];
+            $cells[$sid] = $p;
+            $totDone += $p['done']; $totTotal += $p['total'];
+        }
+        $rows[] = ['id' => $mid, 'name' => $m['name'], 'submitted' => (bool)$m['submitted'],
+                   'cells' => $cells, 'done' => $totDone, 'total' => $totTotal];
+    }
+    return ['spots' => $spots, 'members' => $rows];
+}
+
 // ── 제출 & 잠금 ──────────────────────────────────────────
 function member_submission(int $memberId): ?array {
     $st = db()->prepare('SELECT * FROM submissions WHERE member_id = ?');
@@ -205,110 +393,135 @@ function is_submitted(int $memberId): bool {
  * 참가자 제출. 모든 필수 항목이 채워져야 하며, 제출 후에는 잠금.
  * @return array{ok:bool, notice:?string}  notice: 전원 제출 완료 시 메시지
  */
-function submit_member(int $memberId, ?string $surveyorType, ?string $siteName): array {
-    if (is_submitted($memberId)) return ['ok' => true, 'notice' => null]; // 멱등
-    $p = member_progress($memberId);
-    if (!$p['complete']) {
-        throw new RuntimeException('아직 완료하지 않은 필수 항목이 있습니다. (남은 항목 ' . $p['remaining'] . '개)');
+function submit_member(int $memberId, ?string $surveyorType, ?string $siteName,
+                       ?bool $wheelchair = null, ?string $visionDetail = null): array {
+    $already = is_submitted($memberId);
+    // 신규 제출일 때만 완화 게이트 확인 (한 탭이라도 완료하면 제출 가능)
+    if (!$already && !member_any_tab_complete($memberId)) {
+        throw new RuntimeException('아직 완료한 탭이 없습니다. 최소 한 개 탭의 필수 항목을 모두 완료해 주세요.');
     }
-    $site = $siteName !== null ? trim($siteName) : '';
+    $site  = $siteName !== null ? trim($siteName) : '';
     $sites = site_list();
     if ($sites && !in_array($site, $sites, true)) {
         throw new RuntimeException('유효한 관광지를 선택하세요.');
     }
+    $vision = $visionDetail !== null && trim($visionDetail) !== '' ? trim($visionDetail) : null;
+    if ($vision !== null && !in_array($vision, ['전맹', '저시력'], true)) $vision = null;
+    $wc   = $wheelchair === null ? null : ($wheelchair ? 1 : 0);
+    $surv = $surveyorType !== null && trim($surveyorType) !== '' ? trim($surveyorType) : null;
+    $sn   = $site !== '' ? $site : null;
+
+    if ($already) {
+        // 구글폼 방식: 이미 제출됨 → 메타 정보만 수정 (응답은 자동 저장으로 반영)
+        $upd = db()->prepare(
+            'UPDATE submissions SET surveyor_type = ?, wheelchair = ?, vision_detail = ?, site_name = ? WHERE member_id = ?');
+        $upd->execute([$surv, $wc, $vision, $sn, $memberId]);
+        return ['ok' => true, 'notice' => null, 'edited' => true];
+    }
+
     $ins = db()->prepare(
-        sql_insert_ignore() . ' INTO submissions (member_id, surveyor_type, site_name, submitted_at)
-         VALUES (?, ?, ?, NOW())');
-    $ins->execute([$memberId,
-                   $surveyorType !== null && trim($surveyorType) !== '' ? trim($surveyorType) : null,
-                   $site !== '' ? $site : null]);
-    return ['ok' => true, 'notice' => check_and_notify_completion_sites()];
+        sql_insert_ignore() . ' INTO submissions
+            (member_id, surveyor_type, wheelchair, vision_detail, site_name, submitted_at)
+         VALUES (?, ?, ?, ?, ?, NOW())');
+    $ins->execute([$memberId, $surv, $wc, $vision, $sn]);
+
+    // 이 참가자가 속한 조의 완료 여부 확인 → 완료 시 조별 메일
+    $teamId = (int)db()->query('SELECT team_id FROM members WHERE id = ' . (int)$memberId)->fetchColumn();
+    return ['ok' => true, 'notice' => check_and_notify_team($teamId), 'edited' => false];
 }
 
-// ── 전원 제출 완료 → 자동 메일(1회) ──────────────────────
+// ── 제출 인원 집계 ───────────────────────────────────────
 function total_member_count(): int {
     return (int)db()->query('SELECT COUNT(*) FROM members')->fetchColumn();
 }
 function submitted_count(): int {
     return (int)db()->query('SELECT COUNT(*) FROM submissions')->fetchColumn();
 }
-/** 등록된 모든 참가자가 제출했는가? (참가자 ≥ 1) */
-function all_submitted(): bool {
-    $total = total_member_count();
-    return $total > 0 && submitted_count() >= $total;
-}
 
+// ── 조 완료 → 조별 알림 메일(1회) ────────────────────────
 /**
- * 필수 관광지(1~4번)가 모두 커버되면 (처음 1회) 운영진에게 알림 메일 발송.
- * completions 테이블의 단일 행(id=1)으로 중복 발송 방지.
+ * 조가 완료(기준 인원 이상 제출)되면 처음 1회 운영진에게 조별 알림 메일 발송.
+ * completions(team_id) 로 조별 중복 발송 방지.
  * @return ?string 신규 완료 시 메시지, 아니면 null
  */
-function check_and_notify_completion_sites(): ?string {
-    if (!sites_complete()) return null;
-    $ex = db()->query('SELECT email_sent FROM completions WHERE id = 1')->fetch();
-    if ($ex) return null;
+function check_and_notify_team(int $teamId): ?string {
+    if ($teamId <= 0 || !team_is_complete($teamId)) return null;
+    $chk = db()->prepare('SELECT 1 FROM completions WHERE team_id = ?');
+    $chk->execute([$teamId]);
+    if ($chk->fetch()) return null;   // 이미 처리됨
     $ins = db()->prepare(
-        sql_insert_ignore() . ' INTO completions (id, completed_at, email_sent) VALUES (1, NOW(), 0)');
-    $ins->execute();
-    if ($ins->rowCount() === 0) return null; // 동시성: 다른 요청이 먼저 처리
+        sql_insert_ignore() . ' INTO completions (team_id, completed_at, email_sent) VALUES (?, NOW(), 0)');
+    $ins->execute([$teamId]);
+    if ($ins->rowCount() === 0) return null;   // 동시성: 다른 요청이 먼저 처리
 
+    $tn = db()->prepare('SELECT name FROM teams WHERE id = ?');
+    $tn->execute([$teamId]);
+    $teamName = (string)$tn->fetchColumn();
     $err = null;
-    $ok = send_completion_mail($err);
+    $ok = send_team_completion_mail($teamId, $err);
+    $cnt = team_submitted_count($teamId);
     return $ok
-        ? '🎉 관광지 1~4번 모니터링 완료! 운영진에게 결과 알림 메일을 발송했습니다.'
-        : '🎉 관광지 1~4번 모니터링 완료! (메일 발송 실패: ' . h($err) . ')';
+        ? "🎉 {$teamName} 제출 완료! (제출 {$cnt}명) 운영진에게 알림 메일을 보냈습니다."
+        : "🎉 {$teamName} 제출 완료! (메일 발송 실패: " . h($err) . ")";
 }
 
-/** 완료 메일 실제 발송 + completions(id=1) 결과 갱신. 발신/수신은 관리자 설정 우선. */
-function send_completion_mail(?string &$err = null): bool {
+/** 조 완료 메일 실제 발송 + completions(team_id) 결과 갱신. */
+function send_team_completion_mail(int $teamId, ?string &$err = null): bool {
     require_once __DIR__ . '/smtp.php';
-    $subject = sprintf('[%s] 모니터링 조사 완료 알림', APP_TITLE);
-    $body = completion_mail_body();
+    $tn = db()->prepare('SELECT name FROM teams WHERE id = ?');
+    $tn->execute([$teamId]);
+    $teamName = (string)$tn->fetchColumn();
+    $subject = sprintf('[%s] %s 제출 완료 알림', APP_TITLE, $teamName);
+    $body = team_completion_mail_body($teamId);
     $err = null;
     $ok = send_mail((string)mail_cfg('NOTIFY_TO'), (string)mail_cfg('NOTIFY_TO_NAME'), $subject, $body, $err);
-    $upd = db()->prepare('UPDATE completions SET email_sent = ?, email_error = ? WHERE id = 1');
-    $upd->execute([$ok ? 1 : 0, $ok ? null : mb_substr((string)$err, 0, 250)]);
+    $upd = db()->prepare('UPDATE completions SET email_sent = ?, email_error = ? WHERE team_id = ?');
+    $upd->execute([$ok ? 1 : 0, $ok ? null : mb_substr((string)$err, 0, 250), $teamId]);
     return $ok;
 }
 
-/** 관리자 강제 발송 (전원 제출 여부와 무관하게 완료 기록 후 발송) */
-function force_send_completion(): bool {
-    if (!db()->query('SELECT 1 FROM completions WHERE id = 1')->fetch()) {
-        $ins = db()->prepare(sql_insert_ignore() . ' INTO completions (id, completed_at, email_sent) VALUES (1, NOW(), 0)');
-        $ins->execute();
+/** 관리자 강제 발송(조별) — 완료 여부와 무관하게 완료기록 후 발송 */
+function force_send_team_completion(int $teamId): bool {
+    if ($teamId <= 0) return false;
+    $chk = db()->prepare('SELECT 1 FROM completions WHERE team_id = ?');
+    $chk->execute([$teamId]);
+    if (!$chk->fetch()) {
+        $ins = db()->prepare(sql_insert_ignore() . ' INTO completions (team_id, completed_at, email_sent) VALUES (?, NOW(), 0)');
+        $ins->execute([$teamId]);
     }
-    return send_completion_mail($e);
+    return send_team_completion_mail($teamId, $e);
 }
-/** (호환용) 완료 메일 재발송 = 강제 발송 */
-function resend_completion_mail(): bool { return force_send_completion(); }
+/** (호환용) 재발송 = 조별 강제 발송 */
+function resend_completion_mail(int $teamId = 0): bool { return force_send_team_completion($teamId); }
 
-/** 완료 알림 메일 본문(HTML) — 관광지별 제출 현황 요약 */
-function completion_mail_body(): string {
+/** 조 완료 알림 메일 본문(HTML) — 조원 제출 현황 */
+function team_completion_mail_body(int $teamId): string {
     $title = h(APP_TITLE);
     $when  = date('Y-m-d H:i');
-    $counts = site_submission_counts();
-    $req    = required_sites();
-    $subTotal = submitted_count();
+    $tn = db()->prepare('SELECT name FROM teams WHERE id = ?');
+    $tn->execute([$teamId]);
+    $teamName  = h((string)$tn->fetchColumn());
+    $threshold = team_complete_threshold();
+    $sub   = team_submitted_count($teamId);
+    $total = team_member_count($teamId);
     $trs = '';
-    foreach (site_list() as $i => $s) {
-        $c = $counts[$s] ?? 0;
-        $isReq = in_array($s, $req, true);
-        $mark  = $c > 0 ? '✅' : '⬜';
-        $star  = $isReq ? ' <span style="color:#c0392b">*</span>' : '';
-        $trs .= '<tr><td style="padding:6px;border-top:1px solid #eee">' . ($i + 1) . '. ' . h($s) . $star . '</td>'
-              . '<td style="padding:6px;border-top:1px solid #eee">' . $mark . ' ' . $c . '건</td></tr>';
+    foreach (team_members_status($teamId) as $m) {
+        $mark = $m['submitted'] ? '✅ 제출' : '⬜ 미제출';
+        $trs .= '<tr><td style="padding:6px;border-top:1px solid #eee">' . h($m['name']) . '</td>'
+              . '<td style="padding:6px;border-top:1px solid #eee">' . $mark . '</td></tr>';
     }
     return <<<HTML
 <div style="font-family:'Malgun Gothic',sans-serif;max-width:560px;margin:auto">
-  <h2 style="color:#1a7f5a">✅ 모니터링 조사 완료 알림</h2>
+  <h2 style="color:#1a7f5a">✅ {$teamName} 제출 완료</h2>
   <p><strong>{$title}</strong></p>
   <table style="border-collapse:collapse;width:100%">
-    <tr><td style="padding:6px;color:#666">기준 시각</td><td style="padding:6px">{$when}</td></tr>
-    <tr><td style="padding:6px;color:#666">총 제출</td><td style="padding:6px"><strong>{$subTotal} 건</strong></td></tr>
+    <tr><td style="padding:6px;color:#666">조</td><td style="padding:6px">{$teamName}</td></tr>
+    <tr><td style="padding:6px;color:#666">완료 시각</td><td style="padding:6px">{$when}</td></tr>
+    <tr><td style="padding:6px;color:#666">제출 인원</td><td style="padding:6px"><strong>{$sub} / {$total} 명</strong> (완료 기준 {$threshold}명 이상)</td></tr>
   </table>
-  <h3 style="color:#146147;margin:16px 0 4px">관광지별 제출 현황 <span style="color:#c0392b;font-size:12px">(* = 완료 필수)</span></h3>
+  <h3 style="color:#146147;margin:16px 0 4px">조원 제출 현황</h3>
   <table style="border-collapse:collapse;width:100%">
-    <tr><th style="text-align:left;padding:6px;color:#666">관광지</th><th style="text-align:left;padding:6px;color:#666">제출</th></tr>
+    <tr><th style="text-align:left;padding:6px;color:#666">이름</th><th style="text-align:left;padding:6px;color:#666">상태</th></tr>
     {$trs}
   </table>
   <p style="color:#999;font-size:12px;margin-top:16px">이 메일은 시스템이 자동 발송했습니다.</p>
@@ -550,4 +763,166 @@ function leaderboard(): array {
         $r['rank'] = $rank; $prev = $r['submitted'];
     }
     return $rows;
+}
+
+// ══════════════════════════════════════════════════════════
+//  관리자 비밀번호 (settings 테이블에 password_hash 저장, 없으면 config.php 상수)
+// ══════════════════════════════════════════════════════════
+
+/** 입력한 비밀번호가 현재 관리자 비밀번호와 일치하는지. */
+function admin_pw_verify(string $pw): bool {
+    $hash = (string)(setting('ADMIN_PASSWORD_HASH') ?? '');
+    if ($hash !== '') {
+        return password_verify($pw, $hash);
+    }
+    // 아직 해시가 없으면 config.php 상수와 평문 비교 (초기 상태 호환)
+    return defined('ADMIN_PASSWORD') && hash_equals(ADMIN_PASSWORD, $pw);
+}
+/** 새 비밀번호로 갱신 (해시 저장). */
+function admin_pw_set(string $newPw): void {
+    if (strlen($newPw) < 8) {
+        throw new RuntimeException('비밀번호는 최소 8자 이상이어야 합니다.');
+    }
+    set_setting('ADMIN_PASSWORD_HASH', password_hash($newPw, PASSWORD_DEFAULT));
+}
+
+// ══════════════════════════════════════════════════════════
+//  사진/영상 업로드 (탭별 = 관광지 단위)
+// ══════════════════════════════════════════════════════════
+
+if (!defined('UPLOAD_DIR')) {
+    define('UPLOAD_DIR', __DIR__ . DIRECTORY_SEPARATOR . 'uploads');
+}
+if (!defined('UPLOAD_URL_BASE')) {
+    define('UPLOAD_URL_BASE', 'uploads');   // htdocs 기준 상대 URL
+}
+if (!defined('UPLOAD_MAX_BYTES')) {
+    // 40MB — PHP 기본 upload_max_filesize/post_max_size(40M) 안쪽으로.
+    define('UPLOAD_MAX_BYTES', 10 * 1024 * 1024);   // InfinityFree 무료 플랜 제한: 10MB
+}
+
+/** 허용 확장자 → mime 유형. 나머지는 거부. */
+function upload_allowed_types(): array {
+    return [
+        'jpg'  => ['image', 'image/jpeg'],
+        'jpeg' => ['image', 'image/jpeg'],
+        'png'  => ['image', 'image/png'],
+        'webp' => ['image', 'image/webp'],
+        'heic' => ['image', 'image/heic'],
+        'heif' => ['image', 'image/heif'],
+        'gif'  => ['image', 'image/gif'],
+        'mp4'  => ['video', 'video/mp4'],
+        'mov'  => ['video', 'video/quicktime'],
+        'm4v'  => ['video', 'video/x-m4v'],
+        'webm' => ['video', 'video/webm'],
+        '3gp'  => ['video', 'video/3gpp'],
+    ];
+}
+
+/** 참가자 한 명의 지정 탭에 올려둔 파일 목록. spot_id=null 이면 전체. */
+function uploads_for(int $memberId, ?int $spotId = null): array {
+    if ($spotId === null) {
+        $st = db()->prepare('SELECT * FROM uploads WHERE member_id = ? ORDER BY spot_id, id');
+        $st->execute([$memberId]);
+    } else {
+        $st = db()->prepare('SELECT * FROM uploads WHERE member_id = ? AND spot_id = ? ORDER BY id');
+        $st->execute([$memberId, $spotId]);
+    }
+    return $st->fetchAll();
+}
+
+/** 업로드 저장. 성공 시 uploads 행 id, 실패 시 예외. */
+function upload_save(int $memberId, int $spotId, array $file): int {
+    if (($file['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+        $codes = [
+            UPLOAD_ERR_INI_SIZE   => '파일이 서버 설정(upload_max_filesize) 을 초과했습니다.',
+            UPLOAD_ERR_FORM_SIZE  => '파일이 폼 크기 제한을 초과했습니다.',
+            UPLOAD_ERR_PARTIAL    => '파일이 일부만 전송됐습니다.',
+            UPLOAD_ERR_NO_FILE    => '파일이 선택되지 않았습니다.',
+            UPLOAD_ERR_NO_TMP_DIR => '임시 폴더가 없습니다.',
+            UPLOAD_ERR_CANT_WRITE => '디스크에 쓸 수 없습니다.',
+            UPLOAD_ERR_EXTENSION  => 'PHP 확장 모듈에 의해 차단됐습니다.',
+        ];
+        $msg = $codes[$file['error']] ?? '알 수 없는 업로드 오류';
+        throw new RuntimeException("업로드 실패: {$msg}");
+    }
+    $size = (int)($file['size'] ?? 0);
+    if ($size <= 0)               throw new RuntimeException('빈 파일은 올릴 수 없습니다.');
+    if ($size > UPLOAD_MAX_BYTES) throw new RuntimeException('파일이 너무 큽니다. 40MB 이하로 올려주세요.');
+
+    $orig = (string)($file['name'] ?? 'upload');
+    $ext  = strtolower(pathinfo($orig, PATHINFO_EXTENSION));
+    $allowed = upload_allowed_types();
+    if (!isset($allowed[$ext])) {
+        throw new RuntimeException('사진(jpg/png/webp/heic/gif) 또는 영상(mp4/mov/webm/m4v/3gp) 파일만 올릴 수 있습니다.');
+    }
+    [$kind, $expectMime] = $allowed[$ext];
+
+    // 실제 파일 내용의 mime 도 검사 (확장자만 바꾼 우회 방지)
+    $tmp = (string)($file['tmp_name'] ?? '');
+    if (!$tmp || !is_uploaded_file($tmp)) {
+        throw new RuntimeException('임시 파일을 찾을 수 없습니다.');
+    }
+    $finfo = finfo_open(FILEINFO_MIME_TYPE);
+    $actualMime = $finfo ? (string)finfo_file($finfo, $tmp) : '';
+    if ($finfo) finfo_close($finfo);
+    if ($actualMime && strpos($actualMime, $kind === 'image' ? 'image/' : 'video/') !== 0) {
+        // 파일 내용이 사진/영상이 아니면 거부
+        throw new RuntimeException("파일 내용이 {$kind} 로 보이지 않습니다 (감지된 형식: {$actualMime}).");
+    }
+
+    // 저장 폴더: uploads/member_{id}/spot_{id}/
+    $subDir = "member_{$memberId}" . DIRECTORY_SEPARATOR . "spot_{$spotId}";
+    $absDir = UPLOAD_DIR . DIRECTORY_SEPARATOR . $subDir;
+    if (!is_dir($absDir) && !@mkdir($absDir, 0775, true) && !is_dir($absDir)) {
+        throw new RuntimeException("저장 폴더를 만들 수 없습니다: {$absDir}");
+    }
+
+    // 파일명 — 타임스탬프 + 랜덤 + 원래 확장자. 원래 이름은 DB 에만 보관.
+    $safeExt = preg_replace('/[^a-z0-9]/', '', $ext) ?: 'bin';
+    $stored = date('Ymd_His') . '_' . bin2hex(random_bytes(4)) . '.' . $safeExt;
+    $absPath = $absDir . DIRECTORY_SEPARATOR . $stored;
+    if (!move_uploaded_file($tmp, $absPath)) {
+        throw new RuntimeException('파일을 저장하는 중 오류가 발생했습니다.');
+    }
+
+    // DB 기록 (URL 은 forward-slash 로 저장)
+    $relPath = str_replace(DIRECTORY_SEPARATOR, '/', $subDir . DIRECTORY_SEPARATOR . $stored);
+    $ins = db()->prepare(
+        'INSERT INTO uploads (member_id, spot_id, kind, orig_name, stored_path, mime, size_bytes) '
+        . 'VALUES (?, ?, ?, ?, ?, ?, ?)'
+    );
+    $ins->execute([
+        $memberId, $spotId, $kind,
+        mb_substr($orig, 0, 240),
+        $relPath,
+        $actualMime ?: $expectMime,
+        $size,
+    ]);
+    return (int)db()->lastInsertId();
+}
+
+/** 업로드 삭제 — 소유자(member_id) 검증 후 파일 + DB 행 제거. */
+function upload_delete(int $uploadId, int $memberId): bool {
+    $st = db()->prepare('SELECT * FROM uploads WHERE id = ? AND member_id = ?');
+    $st->execute([$uploadId, $memberId]);
+    $row = $st->fetch();
+    if (!$row) return false;
+    $abs = UPLOAD_DIR . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, (string)$row['stored_path']);
+    if (is_file($abs)) @unlink($abs);
+    $d = db()->prepare('DELETE FROM uploads WHERE id = ?');
+    $d->execute([$uploadId]);
+    return true;
+}
+
+/** 브라우저용 URL (htdocs 기준). */
+function upload_url(array $upload): string {
+    return UPLOAD_URL_BASE . '/' . (string)$upload['stored_path'];
+}
+
+/** 사람이 읽는 파일 크기 표시. */
+function upload_size_h(int $bytes): string {
+    if ($bytes < 1024) return $bytes . ' B';
+    if ($bytes < 1024 * 1024) return round($bytes / 1024, 1) . ' KB';
+    return round($bytes / 1024 / 1024, 1) . ' MB';
 }
